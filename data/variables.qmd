@@ -1,0 +1,31 @@
+---
+format: html
+---
+
+# Data pre-proc
+
+## Loading the data
+
+```{r}
+#| cache: true
+#| label: data-loading
+library(data.table)
+
+# Processing kpis
+kpis <- fread("data-raw/kpis file.csv")
+vars <- fread("data-raw/variables file.csv")
+```
+
+## Cleaning KPIS
+
+```{r}
+#| label: cleaning-kpis
+# Removing all double quotes
+kpis <- kpis[, lapply(.SD, \(x) {
+  gsub("^[\"]{2,}(.+)[\"]{2,}$", "\\1", x, perl = TRUE)
+})]
+
+# Looking at IsBad
+kpis[, table(IsBad)]
+```
+
