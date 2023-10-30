@@ -1,22 +1,27 @@
 ---
-format: html
+format: gfm
 ---
 
 # Data pre-proc
 
+This document describes the steps I followed to pre-process the data for building a predictive model of fraud. I will use the `data.table` package for this.
+
+
 ## Loading the data
+
+```{r}
+library(data.table)
+```
 
 ```{r}
 #| cache: true
 #| label: data-loading
-library(data.table)
-
 # Processing kpis
 kpis <- fread("data-raw/kpis file.csv")
 vars <- fread("data-raw/variables file.csv")
 ```
 
-## Cleaning KPIS
+## Cleaning KPIS main variables (return and isbad)
 
 ```{r}
 #| label: cleaning-kpis
@@ -25,7 +30,235 @@ kpis <- kpis[, lapply(.SD, \(x) {
   gsub("^[\"]{2,}(.+)[\"]{2,}$", "\\1", x, perl = TRUE)
 })]
 
-# Looking at IsBad
+# Checking IsBad
 kpis[, table(IsBad)]
+kpis[, IsBad := as.numeric(IsBad)]
+
+# Checking GRODI180
+kpis[grepl("[[:alpha:]]", GRODI180, perl = TRUE), ][, table(GRODI180)] # only NULL
+
+kpis[, GRODI180 := as.numeric(GRODI180)] 
 ```
 
+## Creating an indicator variable for fraud
+
+```{r}
+# Generating the variable
+kpis[, is_fraud := as.numeric((IsBad == 1) & (GRODI180 == 0))]
+
+# Cross tabulating it with the other two
+kpis[GRODI180 == 0, table(is_fraud, IsBad, useNA = "always")]
+kpis[GRODI180 != 0, table(is_fraud, IsBad, useNA = "always")]
+```
+
+## Characteristics of the application
+
+Amount
+
+```{r}
+kpis[, FundedLoanAmount := as.numeric(FundedLoanAmount)]
+```
+
+Loan types
+
+```{r}
+# Removing NULL
+kpis <- kpis[LoanType != "NULL"]
+
+kpis[, length(unique(LoanType))] # 59 (we can tabulate)
+loan_types <- kpis[, as.data.table(prop.table(table(LoanType)))][order(-N)]
+loan_types[, Ncum := sprintf("%.4f", cumsum(N))]
+
+# Many of these could predict fraud exactly
+kpis[, as.data.table(
+  table(LoanType, is_fraud, useNA = "always")
+  )][order(-N)]
+
+# Generating a correlation between loan type and fraud
+kpis[, perfect := mean(is_fraud), by = LoanType]
+kpis[perfect >.90] # 2 records
+
+# Removing those records and cleaning the variable
+kpis <- kpis[perfect <= .90][, perfect := NULL]
+
+# Generating an indicator for loan types, we will only analyze
+# Those for which we have at least 100 obs
+loan_types2 <- kpis[, as.data.table(table(LoanType))][order(-N)]
+loan_types2 <- loan_types2[N >= 100]
+
+kpis <- kpis[LoanType %in% loan_types2$LoanType]
+
+for (lt in head(loan_types2$LoanType, -1)) # Excluding the last one (indicator)
+  kpis[, paste0("lt_", lt) := as.numeric(LoanType == lt)]
+```
+
+Term
+
+```{r}
+kpis[, length(unique(Term))] # 23
+kpis[, as.data.table(table(Term))][order(-N)]
+
+# Turning into numeric
+kpis[, Term := as.numeric(Term)]
+
+# Generating a correlation between term and fraud
+kpis[, perfect := mean(is_fraud), by = Term]
+kpis[perfect >.90] # 0 records
+kpis[, perfect := NULL] # Removing
+```
+
+Pay period
+
+```{r}
+kpis[, length(unique(PayPeriod))] # 5
+kpis[, as.data.table(table(PayPeriod))][order(-N)]
+
+# Removing NULL obs (we can't use them)
+kpis <- kpis[PayPeriod != "NULL"]
+
+# Turning into categorical (indicator variable)
+kpis[, pays_weekly := as.numeric(PayPeriod == "WEEKLY")]
+kpis[, pays_biweekly := as.numeric(PayPeriod == "BI_WEEKLY")]
+kpis[, pays_semimonth := as.numeric(PayPeriod == "SEMI_MONTHLY")]
+kpis[, pays_monthly := as.numeric(PayPeriod == "MONTHLY")]
+
+# Tabulating
+# kpis[, table(PayPeriod, pays_weekly)] Reference
+kpis[, table(PayPeriod, pays_biweekly)]
+kpis[, table(PayPeriod, pays_semimonth)]
+kpis[, table(PayPeriod, pays_monthly)]
+```
+
+At this point, I would make sure I have two types of observations for the model:
+
+1. Fraud observations, and
+2. Loans that were approved.
+
+We can't know if an unapproved loan could have been fraud!
+
+```{r}
+kpis <- kpis[(FundedIndicator == "1") | is_fraud]
+kpis[, table(FundedIndicator, is_fraud)]
+```
+
+I would leave it there. I could continue parsing variables in this fashion. We will only keep the numeric variables
+
+```{r}
+kpis2 <- kpis[, .SD, .SDcols = c(
+  "is_fraud", "Term", "pays_biweekly", "pays_semimonth", 
+  "pays_monthly", "UniqueID", "FundedLoanAmount",
+  colnames(kpis)[grep("lt_", colnames(kpis))])
+  ]
+```
+
+# Processing variables
+
+Because of the number of variables, I would inspect the overall types of all. If all are numeric, I would then continue. Otherwise, I would have to analyze in detail.
+
+```{r}
+vars_types <- vars[, unlist(lapply(.SD, class))]
+vars_types <- data.table(
+  var = names(vars_types),
+  type = vars_types
+)
+
+vars_types[, table(type)]
+```
+
+Since a sizable number are 'character'; I'll assess if we can turn them into numeric. For now, I'll just check whether NULL/NA values can be found, and after that, I'll check if they can be turned into numeric
+
+```{r}
+#| warning: false
+vars_char <- vars[, lapply(.SD, function(x) {
+  fifelse((x == "NULL") | (x == "NA"), NA_character_, x)
+}), .SDcols = vars_types[type == "character", var]]
+
+# Reassessing if have any character
+vars_char_all_num <- vars_char[, lapply(.SD, \(x) !any(grepl("[[:alpha:]]+", x)))] |> unlist()
+
+# Clunky, but works
+for (v in names(vars_char_all_num)[which(vars_char_all_num)])
+  vars[, c(v) := as.numeric(.SD[[1]]), .SDcols = v]
+```
+
+For now, I will skip the rest of the variables (I only have about 20 minutes left for the ShinyApp!) Preserving only numeric types (plus the ID)
+
+```{r}
+
+vars_types <- vars[, unlist(lapply(.SD, class))]
+vars_types <- data.table(
+  var = names(vars_types),
+  type = vars_types
+)
+
+vars_types[, table(type)]
+tokeep <- vars_types[type %in% c("integer", "numeric")]$var |>
+  c("lenderuniqueid") 
+
+vars <- vars[, ..tokeep]
+```
+
+
+
+
+## Processing the id variable
+
+We start by inspecting whether the ids can be merged:
+
+```{r}
+str(kpis[,1:10])
+str(vars[,1:10])
+```
+
+Looking at the first few, it seems that the `lenderuniqueid` may provide extra information (so it doesn't fully match with vars.):
+
+```{r}
+merge(kpis, vars, by.x = "UniqueID", by.y = "lenderuniqueid") # is empty
+```
+
+For now, I will assume that the `UniqueID` is the same as `lenderuniqueid`, and the extra information in lenderuniqueid is not relevant. After that, we can merge both datasets
+
+```{r}
+vars[, UniqueID := gsub("_[0-9]+$", "", lenderuniqueid, perl = TRUE)]
+vars <- merge(vars, kpis, by = "UniqueID") # This merges
+```
+
+## Finally, we will only keep variables for which we have enough information
+
+```{r}
+avg_missing <- vars[, unlist(lapply(.SD, \(x) mean(is.na(x))))]
+avg_missing <- data.table(
+  var = names(avg_missing),
+  avg_missing = avg_missing
+)
+
+# Sorting
+setorder(avg_missing, avg_missing)
+
+# We will tolerate 10% missing
+avg_missing <- avg_missing[avg_missing <= .1]
+
+vars <- subset(vars, select = c(
+  avg_missing$var, "lenderuniqueid", "is_fraud", "UniqueID"
+  ))
+```
+
+# Saving the data
+
+To make things easy, only the complete cases
+
+```{r}
+idx <- complete.cases(vars) |> which()
+length(idx)
+idx <- vars[idx]
+fwrite(vars, "data/variables.csv.gz")
+```
+
+
+We will also save a smaller version for the app to run faster
+
+```{r}
+set.seed(3312)
+idx <- sample.int(nrow(vars), 20000)
+fwrite(vars[idx], "data/variables20000.csv.gz")
+```
